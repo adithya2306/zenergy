@@ -44,11 +44,15 @@ struct sensor_accumulator {
 	u64 energy_ctr;
 	u64 prev_value;
 	unsigned long cache_timeout;
+	u64 power;
+	u64 prev_energy_ctr;
+	ktime_t last_updated;
 };
 
 struct zenergy_data {
 	struct hwmon_channel_info energy_info;
-	const struct hwmon_channel_info *info[2];
+	struct hwmon_channel_info power_info; /* Power channel information */
+	const struct hwmon_channel_info *info[3];
 	struct hwmon_chip_info chip;
 	struct task_struct *wrap_accumulate;
 	/* Lock around the accumulator */
@@ -61,7 +65,8 @@ struct zenergy_data {
 	int nr_cpus;
 	int nr_socks;
 	int core_id;
-	char (*label)[10];
+	char (*energy_label)[10]; /* Labels for energy sensors (Ecore/Esocket) */
+	char (*power_label)[10];  /* Labels for power sensors (Pcore/Psocket) */
 	bool do_not_accum;
 };
 
@@ -72,7 +77,11 @@ static int zenergy_read_labels(struct device *dev,
 {
 	struct zenergy_data *data = dev_get_drvdata(dev);
 
-	*str = data->label[channel];
+	/* Select appropriate label based on sensor type */
+	if (type == hwmon_energy)
+		*str = data->energy_label[channel];
+	else if (type == hwmon_power)
+		*str = data->power_label[channel];
 	return 0;
 }
 
@@ -88,10 +97,13 @@ static void get_energy_units(struct zenergy_data *data)
 	data->energy_units = (rapl_units & zenergy_UNIT_MASK) >> 8;
 }
 
-static void __accumulate_delta(struct sensor_accumulator *accum,
+static void __accumulate_delta(struct zenergy_data *data,
+			       struct sensor_accumulator *accum,
 			       int cpu, u32 reg)
 {
 	u64 input;
+	ktime_t now, delta;
+	u64 d_energy;
 
 #if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
 	rdmsrq_safe_on_cpu(cpu, reg, &input);
@@ -108,6 +120,24 @@ static void __accumulate_delta(struct sensor_accumulator *accum,
 			accum->prev_value + input;
 
 	accum->prev_value = input;
+
+	/* Calculate power (dEnergy / dTime) */
+	now = ktime_get();
+	if (accum->last_updated) {
+		delta = ktime_sub(now, accum->last_updated);
+		if (ktime_to_us(delta) > 0) {
+			/* d_energy: total accumulated energy delta since the beginning */
+			d_energy = accum->energy_ctr - accum->prev_energy_ctr;
+			/*
+			 * Power (uW) = [d_energy (raw units) * 1,000,000 / 2^units] * 1,000,000 (for uW) / dTime (us)
+			 * Using uJ and us for power calculation to stay within u64 range.
+			 */
+			accum->power = div64_u64(div64_ul(d_energy * 1000000UL, BIT(data->energy_units)) * 1000000ULL, ktime_to_us(delta));
+		}
+	}
+	accum->last_updated = now;
+	accum->prev_energy_ctr = accum->energy_ctr;
+
 	accum->cache_timeout = (jiffies + HZ + get_random_long()) % HZ;
 }
 
@@ -115,7 +145,7 @@ static void accumulate_delta(struct zenergy_data *data,
 			     int channel, int cpu, u32 reg)
 {
 	mutex_lock(&data->lock);
-	__accumulate_delta(&data->accums[channel], cpu, reg);
+	__accumulate_delta(data, &data->accums[channel], cpu, reg);
 	mutex_unlock(&data->lock);
 }
 
@@ -167,12 +197,19 @@ static int zenergy_read(struct device *dev,
 	accum = &data->accums[channel];
 
 	mutex_lock(&data->lock);
+	/* Refresh data if cache has expired or on first read */
 	if (!accum->energy_ctr || time_after(jiffies, accum->cache_timeout))
-		__accumulate_delta(accum, cpu, reg);
+		__accumulate_delta(data, accum, cpu, reg);
 	energy = accum->energy_ctr;
+
+	/* Report power if requested (calculated during __accumulate_delta) */
+	if (type == hwmon_power)
+		*val = accum->power;
 	mutex_unlock(&data->lock);
 
-	*val = div64_ul(energy * 1000000UL, BIT(data->energy_units));
+	/* Report accumulated energy in microwatt-hours if requested */
+	if (type == hwmon_energy)
+		*val = div64_ul(energy * 1000000UL, BIT(data->energy_units));
 
 	return 0;
 }
@@ -213,70 +250,85 @@ static const struct hwmon_ops zenergy_ops = {
 
 static int amd_create_sensor(struct device *dev,
 			     struct zenergy_data *data,
+			     struct hwmon_channel_info *info,
 			     enum hwmon_sensor_types type, u32 config)
 {
-	struct hwmon_channel_info *info = &data->energy_info;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
 	struct cpuinfo_x86 *c = &boot_cpu_data;
 	int num_siblings;
 #endif
-	struct sensor_accumulator *accums;
 	int i, cpus, sockets;
 	u32 *s_config;
 	char (*label_l)[10];
 
+	/* Initialize shared data only once */
+	if (!data->accums) {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
-	/* Identify the number of siblings per core */
-	num_siblings = ((cpuid_ebx(0x8000001e) >> 8) & 0xff) + 1;
+		/* Identify the number of siblings per core */
+		num_siblings = ((cpuid_ebx(0x8000001e) >> 8) & 0xff) + 1;
 
-	/*
-	 * Energy counter register is accessed at core level.
-	 * Hence, filterout the siblings.
-	 */
-	cpus = num_present_cpus() / num_siblings;
+		/*
+		 * Energy counter register is accessed at core level.
+		 * Hence, filterout the siblings.
+		 */
+		cpus = num_present_cpus() / num_siblings;
 
-	/*
-	 * topology_num_cores_per_package (or c->x86_max_cores prior to 6.9) is
-	 * the linux count of physical cores.
-	 * total physical cores/ core per socket gives total number of sockets.
-	 */
+		/*
+		 * topology_num_cores_per_package (or c->x86_max_cores prior to 6.9) is
+		 * the linux count of physical cores.
+		 * total physical cores/ core per socket gives total number of sockets.
+		 */
 
-	sockets = cpus / c->x86_max_cores;
+		sockets = cpus / c->x86_max_cores;
 #else
-	cpus = num_present_cpus() / __max_threads_per_core;
-	sockets = cpus / topology_num_cores_per_package();
+		cpus = num_present_cpus() / __max_threads_per_core;
+		sockets = cpus / topology_num_cores_per_package();
 #endif
 
-	s_config = devm_kcalloc(dev, cpus + sockets + 1,
-				sizeof(u32), GFP_KERNEL);
-	if (!s_config)
-		return -ENOMEM;
+		data->accums = devm_kcalloc(dev, cpus + sockets,
+					    sizeof(struct sensor_accumulator),
+					    GFP_KERNEL);
+		if (!data->accums)
+			return -ENOMEM;
 
-	accums = devm_kcalloc(dev, cpus + sockets,
-			      sizeof(struct sensor_accumulator),
-			      GFP_KERNEL);
-	if (!accums)
-		return -ENOMEM;
+		data->nr_cpus = cpus;
+		data->nr_socks = sockets;
+	}
 
+	cpus = data->nr_cpus;
+	sockets = data->nr_socks;
+
+	/* Allocate and populate labels for this sensor type */
 	label_l = devm_kcalloc(dev, cpus + sockets,
 			       sizeof(*label_l), GFP_KERNEL);
 	if (!label_l)
 		return -ENOMEM;
 
+	for (i = 0; i < cpus + sockets; i++) {
+		if (i < cpus)
+			scnprintf(label_l[i], 10, "%ccore%03u",
+				  (type == hwmon_energy ? 'E' : 'P'), i);
+		else
+			scnprintf(label_l[i], 10, "%csocket%u",
+				  (type == hwmon_energy ? 'E' : 'P'), (i - cpus));
+	}
+
+	if (type == hwmon_energy)
+		data->energy_label = label_l;
+	else if (type == hwmon_power)
+		data->power_label = label_l;
+
+	/* Configure channel attributes */
+	s_config = devm_kcalloc(dev, cpus + sockets + 1,
+				sizeof(u32), GFP_KERNEL);
+	if (!s_config)
+		return -ENOMEM;
+
 	info->type = type;
 	info->config = s_config;
 
-	data->nr_cpus = cpus;
-	data->nr_socks = sockets;
-	data->accums = accums;
-	data->label = label_l;
-
 	for (i = 0; i < cpus + sockets; i++) {
 		s_config[i] = config;
-		if (i < cpus)
-			scnprintf(label_l[i], 10, "Ecore%03u", i);
-		else
-			scnprintf(label_l[i], 10, "Esocket%u", (i - cpus));
 	}
 
 	s_config[i] = 0;
@@ -322,10 +374,19 @@ static int zenergy_probe(struct platform_device *pdev)
 	dev_set_drvdata(dev, data);
 	/* Populate per-core energy reporting */
 	data->info[0] = &data->energy_info;
-	ret = amd_create_sensor(dev, data, hwmon_energy,
+	ret = amd_create_sensor(dev, data, &data->energy_info, hwmon_energy,
 				HWMON_E_INPUT | HWMON_E_LABEL);
 	if (ret)
 		return ret;
+
+	/* Populate per-core power reporting */
+	data->info[1] = &data->power_info;
+	ret = amd_create_sensor(dev, data, &data->power_info, hwmon_power,
+				HWMON_P_INPUT | HWMON_P_LABEL);
+	if (ret)
+		return ret;
+
+	data->info[2] = NULL;
 
 	mutex_init(&data->lock);
 	get_energy_units(data);
