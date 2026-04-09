@@ -12,6 +12,9 @@
 KDIR ?= /lib/modules/`uname -r`/build
 obj-m := zenergy.o
 
+DKMS_NAME := zenergy
+DKMS_VERSION := 0.1.0
+DKMS_ROOT := /usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
 
 default:
 	export CONFIG_SENSOR_zenergy=m;	\
@@ -21,6 +24,14 @@ modules: default
 
 modules_install:
 	$(MAKE) -C $(KDIR) M=$$PWD modules_install
+
+dkms_install:
+	mkdir -p $(DKMS_ROOT)
+	cp Makefile dkms.conf zenergy.c $(DKMS_ROOT)/
+	sed -i "s/@VERSION@/$(DKMS_VERSION)/" $(DKMS_ROOT)/dkms.conf
+	dkms add $(DKMS_NAME)/$(DKMS_VERSION)
+	dkms build $(DKMS_NAME)/$(DKMS_VERSION)
+	dkms install $(DKMS_NAME)/$(DKMS_VERSION)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$$PWD clean
